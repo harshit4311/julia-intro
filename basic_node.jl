@@ -1,51 +1,67 @@
+# basic_node.jl
+
 using DifferentialEquations
-using DiffEqFlux
 using Flux
+using DiffEqFlux
+using Optimisers
 using Plots
-using gradient
 
-# 1. Define ODE dynamics (Lotka-Volterra)
-function lotka_volterra!(du, u, p, t)
-    x, y = u
-    α, β, δ, γ = p
-    du[1] = α * x - β * x * y
-    du[2] = -δ * y + γ * x * y
+# -------------------------------
+# Step 1: Define the true dynamics (ground truth)
+# -------------------------------
+function true_dynamics!(du, u, p, t)
+    du[1] = 2.0 * u[1]
 end
 
-# 2. Initial condition & time setup
-u0 = [1.0, 1.0]
-tspan = (0.0, 10.0)
-tsteps = 0.0:0.1:10.0
+u0 = [1.0]                  # Initial state
+tspan = (0.0, 1.0)          # Time span
+true_prob = ODEProblem(true_dynamics!, u0, tspan)
+true_sol = solve(true_prob, Tsit5(), saveat=0.1)
 
-# 3. Generate "true" data to fit (with true parameters)
-true_p = [1.5, 1.0, 3.0, 1.0]
-prob = ODEProblem(lotka_volterra!, u0, tspan, true_p)
-sol = solve(prob, Tsit5(), saveat=tsteps)
-observed_data = Array(sol)
+# Our training data
+train_ts = true_sol.t
+train_data = hcat(true_sol.u...)  # shape: (state_dim, time_steps)
 
-# 4. Initial guess for parameters (to optimize)
-mutable_p = [2.2, 1.0, 2.0, 0.4]  # must be mutable for training
+# -------------------------------
+# Step 2: Define the Neural ODE model
+# -------------------------------
+# A simple neural network layer
+dudt = Chain(Dense(1, 50, tanh), Dense(50, 1))
 
-# 5. Prediction function
-function predict(p)
-    _prob = remake(prob, p=p)
-    Array(solve(_prob, Tsit5(), saveat=tsteps))
+# Neural ODE wrapper
+n_ode = NeuralODE(dudt, tspan, Tsit5(), saveat=0.1)
+
+# -------------------------------
+# Step 3: Loss Function
+# -------------------------------
+function loss()
+    pred = n_ode(u0)                  # Output shape: (1, num_timesteps)
+    return Flux.Losses.mse(pred, train_data)
 end
 
-# 6. Loss: MSE between prediction and true data
-loss(p) = sum(abs2, predict(p) .- observed_data)
+# -------------------------------
+# Step 4: Optimizer
+# -------------------------------
+opt = Optimisers.Adam(0.05)
+ps = Flux.params(dudt)
 
-# 7. Optimizer setup (ADAM)
-opt = Flux.Optimiser(Adam(0.1))
-state = Flux.setup(opt, mutable_p)
+# -------------------------------
+# Step 5: Training Loop
+# -------------------------------
+epochs = 300
 
-# 8. Training loop (explicit gradient)
-for epoch in 1:100
-    grads = gradient(mutable_p -> loss(mutable_p), mutable_p)
-    Flux.update!(state, mutable_p, grads)
+for epoch in 1:epochs
+    grads = gradient(() -> loss(), ps)
+    Flux.Optimise.update!(opt, ps, grads)
     
-    if epoch % 10 == 0
-        println("Epoch $epoch | Loss: ", loss(mutable_p))
-        display(plot(solve(remake(prob, p=mutable_p), Tsit5(), saveat=tsteps), ylim=(0,6), label=["x" "y"]))
+    if epoch % 50 == 0 || epoch == 1
+        @info "Epoch $epoch, Loss = $(loss())"
     end
 end
+
+# -------------------------------
+# Step 6: Plot results
+# -------------------------------
+predicted = n_ode(u0)
+plot(train_ts, train_data[1, :], label="True", lw=2)
+plot!(train_ts, predicted[1, :], label="Neural ODE", lw=2, linestyle=:dash)
